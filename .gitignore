@@ -9,7 +9,6 @@ __pycache__/
 # 构建产物
 build/
 dist/
-*.spec
 
 # 自检输出
 selftest_result.txt
