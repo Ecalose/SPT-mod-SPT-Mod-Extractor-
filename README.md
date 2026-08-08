@@ -1,5 +1,9 @@
 # 塔科夫离线版 Mod 解压与管理工具
 
+
+（使用DEEPSEEK和Opencode完成该项目，第一次使用ai设计一个可以真正“使用”的程序，设计初衷是因为网上的SPT mod管理器要不就过于臃肿的附加了很多功能，要不然就是NEKOBOX这样的的应用顺带的功能，并没有进行专门的设计和优化，bug很多，因此决定使用 吃白饭的大肥鲸-V4 来写一个自己的mod管理器，赞美梁圣！）
+
+
 为 SPT（Single Player Tarkov，塔科夫离线版）设计的 Mod 安装与管理系统。把 Mod 压缩包拖进窗口，自动识别结构并解压到正确位置；内置 Mod 管理页，支持备份/禁用、收藏、存档类标记与分组。
 
 **下载即用的 exe 请到 [Releases](https://github.com/Nekofur/SPT-mod-SPT-Mod-Extractor-/releases) 页面获取。**
