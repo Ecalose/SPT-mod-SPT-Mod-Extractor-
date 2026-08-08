@@ -1,0 +1,15 @@
+# 本地配置（含个人路径，勿上传）
+config.json
+mods_db.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 构建产物
+build/
+dist/
+*.spec
+
+# 自检输出
+selftest_result.txt
