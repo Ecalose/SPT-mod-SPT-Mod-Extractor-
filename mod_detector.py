@@ -6,7 +6,7 @@ import zipfile
 from dataclasses import dataclass, field
 
 # 结构根目录：出现这些顶层目录说明压缩包自带游戏目录结构
-STRUCTURAL_ROOTS = {"user", "bepinex", "mods", "spt", "game"}
+STRUCTURAL_ROOTS = {"user", "bepinex", "mods", "spt", "spt_runtime", "game"}
 
 # 配对时忽略的通用词
 STOP_TOKENS = {"server", "client", "backend", "mod", "mods", "spt", "aki",
@@ -48,6 +48,8 @@ KIND_NAMES = {
 }
 
 SERVER_PREFIXES = {"spt", "user", "mods"}
+SERVER_ROOT_PROXIES = {"spt", "spt_runtime"}  # 内容整体解压到服务端根（含 SPT/ 与 SPT_Runtime/）
+CLIENT_ROOT_SIBLINGS = {"escapefromtarkov_data"}  # 作为客户端根同级目录原样并入
 BENIGN_NAMES = {"readme", "license", "changelog", "donate", "install", "installation",
                 "requirements", "notice", "upgrade"}
 BENIGN_EXTS = (".txt", ".md", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico",
@@ -164,9 +166,9 @@ def _maybe_unwrap(entries, _depth=0, _stripped=None):
     return entries, (_stripped or [])
 
 
-def _classify(entries, _depth=0):
-    """返回 (kind, mod_name, issue)。"""
-    entries, _ = _maybe_unwrap(entries)
+def _classify(entries):
+    """返回 (kind, mod_name, issue)。
+    entries 应已由 analyze_entries 调用 _maybe_unwrap 剥过包裹目录。"""
     if not entries:
         return KIND_EMPTY, "", ""
     bad = _check_traversal(entries)
@@ -177,24 +179,36 @@ def _classify(entries, _depth=0):
     tops = _top_folders(lc)
     effective = {t for t in tops if not _benign_top(t)}
     structural = effective & STRUCTURAL_ROOTS
-    server_parts = effective & SERVER_PREFIXES
 
     def under(prefix):
         return [e for e, l in zip(entries, lc) if l.startswith(prefix)]
 
-    # 组合包：BepInEx + 服务端前缀（spt/user/mods），其余仅良性文件
-    if "bepinex" in effective and server_parts and (effective - {"bepinex"}) <= server_parts:
-        return KIND_COMBO, "", "包含客户端（BepInEx）与服务端（%s）两部分" % "/".join(sorted(server_parts))
+    # 组合包：BepInEx + 服务端部分（spt/user/mods 或 SPT_Runtime 等代理根），
+    # 可附带客户端根同级目录（EscapeFromTarkov_Data 等），其余仅良性文件
+    server_proxy = effective & (SERVER_PREFIXES | SERVER_ROOT_PROXIES)
+    client_sib = effective & CLIENT_ROOT_SIBLINGS
+    if "bepinex" in effective and server_proxy and \
+            (effective - {"bepinex"} - client_sib) <= (server_proxy | client_sib):
+        return KIND_COMBO, "", "包含客户端（BepInEx）与服务端（%s）两部分" % "/".join(sorted(server_proxy))
 
-    # 整个包是 SPT 根目录内容（顶层只有一个 SPT/）
-    if effective == {"spt"}:
-        name = ""
-        spt_files = under("spt/")
-        if spt_files:
-            parts = spt_files[0].split("/")
-            if len(parts) >= 4 and parts[1] == "user" and parts[2] == "mods":
-                name = parts[3]
-        return KIND_SERVER_ROOT, name, "顶层为 SPT/ 目录，将去除该前缀安装到服务端根目录"
+    # 整个包是 SPT 根目录内容（顶层只有 SPT/ 或 SPT_Runtime/）
+    if effective <= SERVER_ROOT_PROXIES and effective:
+        proxy = next(iter(effective))
+        spt_files = under(proxy + "/")
+        if not spt_files:
+            return KIND_UNKNOWN, "", "顶层为 %s/ 但内部无文件" % proxy
+        # 收集 <proxy>/user/mods/<name> 下出现的全部 mod 名
+        names = set()
+        for e in spt_files:
+            parts = e.split("/")
+            if len(parts) >= 4 and parts[1].lower() == "user" and parts[2].lower() == "mods":
+                names.add(parts[3])
+        if len(names) == 1:
+            name = next(iter(names))
+            return KIND_SERVER_ROOT, name, "顶层为 %s/ 目录，将去除该前缀安装到服务端根目录" % proxy
+        # 多 mod 或无 user/mods 结构：交由 analyze_entries 走整体解压+确认
+        return KIND_SERVER_ROOT, "", (("顶层为 %s/ 目录，含 %d 个 mod，将整体解压到服务端根目录" % (proxy, len(names)))
+                                      if names else "顶层为 %s/ 目录，将去除该前缀安装到服务端根目录" % proxy)
 
     if "user" in structural:
         mods_files = under("user/mods/")
@@ -298,7 +312,8 @@ def structure_brief(entries, kind, mod_name):
     rows = []
     if kind == KIND_COMBO:
         cli = items_under("bepinex/plugins/")
-        srv = items_under("spt/user/mods/") or items_under("user/mods/")
+        srv = (items_under("spt/user/mods/") or items_under("spt_runtime/user/mods/")
+               or items_under("user/mods/"))
         rows.append("客户端 %d 项 → BepInEx\\plugins（%s）" % (len(cli), fmt(cli)))
         rows.append("服务端 %d 项 → user\\mods（%s）" % (len(srv), fmt(srv)))
     elif kind == KIND_SERVER:
@@ -311,7 +326,7 @@ def structure_brief(entries, kind, mod_name):
         mods = items_under("mods/")
         rows.append("旧版 %d 个 mod → mods\\（%s）" % (len(mods), fmt(mods)))
     elif kind == KIND_SERVER_ROOT:
-        mods = items_under("spt/user/mods/")
+        mods = items_under("spt/user/mods/") or items_under("spt_runtime/user/mods/")
         rows.append("服务端 %d 个 mod → user\\mods（%s）" % (len(mods), fmt(mods)))
     elif kind == KIND_SERVER_NAMED:
         rows.append("1 个文件夹（%s）→ user\\mods\\%s" % (mod_name, mod_name))
@@ -328,13 +343,20 @@ def structure_brief(entries, kind, mod_name):
     return rows
 
 
-def analyze_archive(winrar_path, archive, list_fn=None):
-    """分析压缩包结构。list_fn 用于注入（测试）。返回 Analysis。"""
+def analyze_archive(winrar_path, archive, list_fn=None, nanazip_path=None):
+    """分析压缩包结构。返回 Analysis。
+
+    后端选择（NanaZip 全格式优先）：
+      - nanazip_path 给定且有效时，rar/7z 都用 NanaZip 直接 list（7z 不再暂存）。
+      - 否则维持原行为：rar 用 WinRAR list，7z 走 KIND_NEEDS_STAGING 暂存。
+      - zip 一律用 zipfile 原生（更快、加密检测直接）。
+    list_fn 用于注入（测试），覆盖 rar 的 list 后端。
+    """
     a = Analysis(archive=archive)
     ext = os.path.splitext(archive)[1].lower()
     if ext not in (".zip", ".rar", ".7z"):
         a.kind = KIND_NOT_ARCHIVE
-        a.issue = "仅支持 zip / rar / 7z 格式（需要本机安装 WinRAR）"
+        a.issue = "仅支持 zip / rar / 7z 格式（需要本机安装 WinRAR 或 NanaZip）"
         return a
 
     if ext == ".zip":
@@ -352,6 +374,14 @@ def analyze_archive(winrar_path, archive, list_fn=None):
             pass
         return analyze_entries(a, a.entries)
     if ext == ".rar":
+        # 优先 NanaZip，回退 WinRAR
+        if nanazip_path:
+            try:
+                from nanazip import list_with_encrypt as _nz_list_enc
+                a.entries, a.encrypted = _nz_list_enc(nanazip_path, archive)
+                return analyze_entries(a, a.entries)
+            except RuntimeError:
+                pass  # 回退 WinRAR / 暂存
         try:
             a.entries = list_fn(archive) if list_fn else _winrar_list(winrar_path, archive)
         except RuntimeError as exc:
@@ -364,6 +394,14 @@ def analyze_archive(winrar_path, archive, list_fn=None):
             return a
         return analyze_entries(a, a.entries)
 
+    # .7z：NanaZip 可直接 list，否则暂存
+    if nanazip_path:
+        try:
+            from nanazip import list_with_encrypt as _nz_list_enc
+            a.entries, a.encrypted = _nz_list_enc(nanazip_path, archive)
+            return analyze_entries(a, a.entries)
+        except RuntimeError:
+            pass  # 回退暂存
     a.kind = KIND_NEEDS_STAGING
     a.issue = "7z 格式无法直接预览内容，将先解压到临时目录检查，确认安全后才安装到游戏目录"
     return a
@@ -384,7 +422,7 @@ def analyze_entries(a, entries):
     unwrapped, stripped = _maybe_unwrap(entries)
     a.entries = unwrapped
     a.strip_prefixes = stripped
-    a.kind, a.mod_name, a.issue = _classify(unwrapped)
+    a.kind, a.mod_name, a.issue = _classify(a.entries)
     a.summary = structure_brief(a.entries, a.kind, a.mod_name)
     if stripped:
         a.direct_extract = False
@@ -476,14 +514,18 @@ def analyze_entries(a, entries):
         a.confirm_choices = ["安装", "取消"]
         a.direct_extract = False
         cli = sum(1 for e in a.entries if e.lower().startswith("bepinex/"))
-        srv = sum(1 for e in a.entries if e.lower().startswith(
-            tuple(p + "/" for p in SERVER_PREFIXES)))
+        srv = sum(1 for e in a.entries
+                  if e.lower().startswith(tuple(p + "/" for p in (SERVER_PREFIXES | SERVER_ROOT_PROXIES))))
         a.issue = "客户端 %d 个文件 → BepInEx；服务端 %d 个文件 → SPT" % (cli, srv)
     elif a.kind == KIND_SERVER_ROOT:
         a.target_root = "server"
         a.internal_root = ""
         a.target_dir = _join_root("server", "")
         a.direct_extract = False
+        if not a.mod_name:
+            # 多 mod 或无标准 user/mods 结构：整体解压到服务端根，需用户确认
+            a.needs_confirm = True
+            a.confirm_choices = ["整体解压到服务端根目录", "取消"]
     return a
 
 

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """调用本机 WinRAR 的封装：自动检测路径、列出压缩包内容、解压。"""
 import os
-import re
-import subprocess
-import sys
 import winreg
+
+from archive_backend import decode as _decode, run as _run
+from archive_backend import looks_like_archive, is_zip  # 重新导出，保持外部导入兼容
 
 KNOWN_PATHS = [
     r"C:\Program Files\WinRAR\WinRAR.exe",
@@ -59,32 +59,6 @@ def find_winrar():
     return None
 
 
-def _decode(raw):
-    if not raw:
-        return ""
-    for enc in ("utf-8", "gbk", "latin-1"):
-        try:
-            return raw.decode(enc)
-        except (UnicodeDecodeError, ValueError):
-            continue
-    return raw.decode("utf-8", errors="replace")
-
-
-def _run(winrar, args):
-    """运行 WinRAR，返回 (returncode, stdout_text)。隐藏控制台窗口。"""
-    cmd = [winrar] + args
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=3600,
-                              creationflags=flags)
-    except subprocess.TimeoutExpired:
-        return -1, "超时"
-    except OSError as exc:
-        return -1, str(exc)
-    out = _decode(proc.stdout) + _decode(proc.stderr)
-    return proc.returncode, out
-
-
 def find_unrar(winrar):
     """在 WinRAR 目录下找控制台工具 UnRAR.exe（Rar.exe 兜底）。"""
     if not winrar:
@@ -129,14 +103,6 @@ def extract_to(winrar, archive, dest_dir, progress_cb=None):
     if code == 0:
         return True, "解压成功"
     return False, EXIT_MSG.get(code, "解压失败（退出码 %d）" % code)
-
-
-def is_zip(path):
-    return path.lower().endswith(".zip")
-
-
-def looks_like_archive(path):
-    return re.search(r"\.(zip|rar|7z)$", path, re.IGNORECASE) is not None
 
 
 def run_selftest(winrar=None):

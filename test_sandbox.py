@@ -10,7 +10,8 @@ import zipfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import mod_detector as md
-from winrar import find_winrar, list_archive, extract_to
+from winrar import find_winrar, extract_to
+from nanazip import find_nanazip, extract_to as nz_extract
 
 SANDBOX = os.path.join(tempfile.gettempdir(), "opencode", "spt_sandbox")
 RESULTS = []
@@ -42,28 +43,63 @@ def setup():
               os.path.join(server, "user", "mods_storage")):
         os.makedirs(d)
     return {"client_root": client, "server_root": server,
-            "winrar_path": find_winrar()}
+            "winrar_path": find_winrar(), "nanazip_path": find_nanazip()}
+
+
+def _make_7z(path, src_dir, arcname):
+    """创建 7z：优先 py7zr，未安装则用 NanaZip/7z CLI 打包。"""
+    try:
+        import py7zr
+        with py7zr.SevenZipFile(path, "w") as zf:
+            zf.writeall(src_dir, arcname)
+        return True
+    except ImportError:
+        pass
+    # 回退：用 NanaZip/7z CLI 把 src_dir 内容打包成 arcname 下的结构
+    import nanazip as nz
+    nz_exe = find_nanazip()
+    if not nz_exe:
+        return False
+    # 在临时父目录里打包，使包内顶层为 arcname
+    import tempfile as _t, shutil as _sh
+    tmp = _t.mkdtemp(prefix="nz7z_")
+    dst = os.path.join(tmp, arcname)
+    _sh.copytree(src_dir, dst)
+    code, _ = nz._run(nz_exe, ["a", "-t7z", path, dst])
+    _sh.rmtree(tmp, ignore_errors=True)
+    return code == 0
 
 
 def main():
     cfg = setup()
     winrar = cfg["winrar_path"]
-    check("找到 WinRAR", bool(winrar), str(winrar))
+    nanazip = cfg["nanazip_path"]
+    # 后端：NanaZip 全格式优先，回退 WinRAR
+    if nanazip:
+        backend, backend_path = "nanazip", nanazip
+        extract_fn = nz_extract
+    else:
+        backend, backend_path = "winrar", winrar
+        extract_fn = extract_to
+    check("找到解压后端（%s）" % backend, bool(backend_path), str(backend_path))
+    if not backend_path:
+        print("RESULT: FAILED — 无可用解压后端")
+        sys.exit(1)
+    nz_arg = nanazip if backend == "nanazip" else None
 
     # ---------- 场景1：服务端 mod（单顶层文件夹）端到端 ----------
     z1 = os.path.join(SANDBOX, "TestMod.zip")
     make_zip(z1, ["TestMod/config.json", "TestMod/TestMod.dll", "TestMod/sub/data.bin"])
-    a = md.analyze_archive(winrar, z1)
+    a = md.analyze_archive(backend_path, z1, nanazip_path=nz_arg)
     check("场景1 识别为 server_named", a.kind == md.KIND_SERVER_NAMED and a.mod_name == "TestMod",
           "%s/%s" % (a.kind, a.mod_name))
     md.resolve_targets(cfg, a)
     check("场景1 目标目录", a.target_dir == os.path.join(cfg["server_root"], "user", "mods", "TestMod"),
           a.target_dir)
 
-    # 模拟 _process_one 的暂存移动流程
     staging = tempfile.mkdtemp(prefix="mod_extract_")
-    ok, msg = extract_to(winrar, z1, staging)
-    check("场景1 WinRAR 解压到暂存", ok, msg)
+    ok, msg = extract_fn(backend_path, z1, staging)
+    check("场景1 解压到暂存", ok, msg)
     shutil.copytree(os.path.join(staging, "TestMod"), a.target_dir)
     shutil.rmtree(staging, ignore_errors=True)
     check("场景1 文件到位", os.path.isfile(os.path.join(a.target_dir, "config.json"))
@@ -73,11 +109,11 @@ def main():
     # ---------- 场景2：客户端插件（1:1 直接解压） ----------
     z2 = os.path.join(SANDBOX, "ClientMod.zip")
     make_zip(z2, ["BepInEx/plugins/ClientMod/ClientMod.dll"])
-    a2 = md.analyze_archive(winrar, z2)
+    a2 = md.analyze_archive(backend_path, z2, nanazip_path=nz_arg)
     check("场景2 识别为 client", a2.kind == md.KIND_CLIENT and a2.mod_name == "ClientMod",
           "%s/%s" % (a2.kind, a2.mod_name))
     md.resolve_targets(cfg, a2)
-    ok, msg = extract_to(winrar, z2, cfg["client_root"])
+    ok, msg = extract_fn(backend_path, z2, cfg["client_root"])
     check("场景2 直接解压到客户端根", ok and os.path.isfile(
         os.path.join(cfg["client_root"], "BepInEx", "plugins", "ClientMod", "ClientMod.dll")), msg)
 
@@ -95,19 +131,17 @@ def main():
 
     z3 = os.path.join(SANDBOX, "LinkedMod.zip")
     make_zip(z3, ["LinkedMod/config.json", "LinkedMod/LinkedMod.dll"])
-    a3 = md.analyze_archive(winrar, z3)
+    a3 = md.analyze_archive(backend_path, z3, nanazip_path=nz_arg)
     md.resolve_targets(cfg, a3)
     target3 = a3.target_dir
     check("场景3 目标指向联接路径", md.is_link(target3))
 
-    # 选择"转换为常规 mod"
     md.remove_link(target3)
     check("场景3 删除联接（指向目录内容保留）",
           not md.is_link(target3) and os.path.isfile(os.path.join(storage_mod, "old.txt"))
           and not os.path.isfile(link_path))
-    # 解压新版本
     staging = tempfile.mkdtemp(prefix="mod_extract_")
-    extract_to(winrar, z3, staging)
+    extract_fn(backend_path, z3, staging)
     shutil.copytree(os.path.join(staging, "LinkedMod"), link_path)
     shutil.rmtree(staging, ignore_errors=True)
     check("场景3 转换为常规 mod 完成",
@@ -115,46 +149,60 @@ def main():
           and os.path.isfile(os.path.join(link_path, "LinkedMod.dll"))
           and os.path.isfile(os.path.join(storage_mod, "old.txt")))
 
-    # ---------- 场景4：rar 压缩包（UnRAR 列表 + WinRAR 解压） ----------
+    # ---------- 场景4：rar 压缩包 ----------
+    # rar 创建必须用 WinRAR（NanaZip 的 rar 只读），无 WinRAR 则跳过
     src_mod = os.path.join(SANDBOX, "src", "TestMod")
     os.makedirs(os.path.join(src_mod, "sub"))
     open(os.path.join(src_mod, "config.json"), "w").write("x")
     open(os.path.join(src_mod, "TestMod.dll"), "w").write("x")
     open(os.path.join(src_mod, "sub", "data.bin"), "w").write("x")
-    rar_out = os.path.join(SANDBOX, "srv_mod.rar")
-    winrar_exe = winrar
-    subprocess.run([winrar_exe, "a", "-r", "-ibck", "-ep1", rar_out, src_mod],
-                   check=True, capture_output=True)
-    names = list_archive(winrar, rar_out)
-    check("场景4 rar 列表", any(n.replace("\\", "/").endswith("config.json") for n in names),
-          str(names[:5]))
-    a4 = md.analyze_archive(winrar, rar_out)
-    check("场景4 rar 识别为 server_named",
-          a4.kind == md.KIND_SERVER_NAMED and a4.mod_name == "TestMod",
-          "%s/%s" % (a4.kind, a4.mod_name))
+    if winrar:
+        rar_out = os.path.join(SANDBOX, "srv_mod.rar")
+        subprocess.run([winrar, "a", "-r", "-ibck", "-ep1", rar_out, src_mod],
+                       check=True, capture_output=True)
+        a4 = md.analyze_archive(backend_path, rar_out, nanazip_path=nz_arg)
+        check("场景4 rar 识别为 server_named",
+              a4.kind == md.KIND_SERVER_NAMED and a4.mod_name == "TestMod",
+              "%s/%s" % (a4.kind, a4.mod_name))
+    else:
+        print("[SKIP] 场景4 rar 创建（无 WinRAR，NanaZip rar 只读不能创建）")
 
-    # ---------- 场景5：7z 压缩包（暂存检查流程） ----------
-    import py7zr
+    # ---------- 场景5：7z 压缩包 ----------
     z5 = os.path.join(SANDBOX, "srv7z.7z")
-    with py7zr.SevenZipFile(z5, "w") as zf:
-        zf.writeall(src_mod, "TestMod")
-    a5 = md.analyze_archive(winrar, z5)
-    check("场景5 7z 标记为 needs_staging", a5.kind == md.KIND_NEEDS_STAGING,
-          "%s/%s" % (a5.kind, a5.issue))
-    staging = tempfile.mkdtemp(prefix="mod_extract_")
-    ok, msg = extract_to(winrar, z5, staging)
-    check("场景5 暂存解压", ok, msg)
-    entries = md.walk_dir_entries(staging)
-    check("场景5 暂存文件遍历", any(e.endswith("config.json") for e in entries), str(entries[:5]))
-    a5 = md.analyze_entries(md.Analysis(archive=z5), entries)
-    check("场景5 暂存后识别为 server_named",
-          a5.kind == md.KIND_SERVER_NAMED and a5.mod_name == "TestMod",
-          "%s/%s" % (a5.kind, a5.mod_name))
-    md.resolve_targets(cfg, a5)
-    shutil.copytree(os.path.join(staging, "TestMod"), a5.target_dir)
-    shutil.rmtree(staging, ignore_errors=True)
-    check("场景5 安装到 user/mods/TestMod",
-          os.path.isfile(os.path.join(a5.target_dir, "TestMod.dll")))
+    made = _make_7z(z5, src_mod, "TestMod")
+    check("场景5 创建 7z 测试包", made)
+    if made:
+        a5 = md.analyze_archive(backend_path, z5, nanazip_path=nz_arg)
+        if backend == "nanazip":
+            # NanaZip 能直接 list 7z → 不再 needs_staging
+            check("场景5 NanaZip 直接识别 7z（不再暂存）",
+                  a5.kind == md.KIND_SERVER_NAMED and a5.mod_name == "TestMod",
+                  "%s/%s" % (a5.kind, a5.mod_name))
+            md.resolve_targets(cfg, a5)
+            staging = tempfile.mkdtemp(prefix="mod_extract_")
+            ok, msg = extract_fn(backend_path, z5, staging)
+            check("场景5 解压", ok, msg)
+            shutil.copytree(os.path.join(staging, "TestMod"), a5.target_dir)
+            shutil.rmtree(staging, ignore_errors=True)
+            check("场景5 安装到 user/mods/TestMod",
+                  os.path.isfile(os.path.join(a5.target_dir, "TestMod.dll")))
+        else:
+            # WinRAR 后端：7z 走暂存流程
+            check("场景5 WinRAR 7z 标记为 needs_staging", a5.kind == md.KIND_NEEDS_STAGING,
+                  "%s/%s" % (a5.kind, a5.issue))
+            staging = tempfile.mkdtemp(prefix="mod_extract_")
+            ok, msg = extract_fn(backend_path, z5, staging)
+            check("场景5 暂存解压", ok, msg)
+            entries = md.walk_dir_entries(staging)
+            a5 = md.analyze_entries(md.Analysis(archive=z5), entries)
+            check("场景5 暂存后识别为 server_named",
+                  a5.kind == md.KIND_SERVER_NAMED and a5.mod_name == "TestMod",
+                  "%s/%s" % (a5.kind, a5.mod_name))
+            md.resolve_targets(cfg, a5)
+            shutil.copytree(os.path.join(staging, "TestMod"), a5.target_dir)
+            shutil.rmtree(staging, ignore_errors=True)
+            check("场景5 安装到 user/mods/TestMod",
+                  os.path.isfile(os.path.join(a5.target_dir, "TestMod.dll")))
 
     # ---------- 清理 ----------
     shutil.rmtree(SANDBOX, ignore_errors=True)

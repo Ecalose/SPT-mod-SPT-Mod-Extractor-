@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mod_detector as md
 import moddb
 from main import App
+from nanazip import find_nanazip
+from winrar import find_winrar
 
 SANDBOX = os.path.join(tempfile.gettempdir(), "opencode", "flow_sandbox")
 PASSED = []
@@ -31,6 +33,7 @@ class AutoApp(App):
         self.queue = __import__("queue").Queue()
         self.worker_active = False
         self.scan_busy = False
+        self._backend_cache = None
         self.choices = []
         self.logs = []
 
@@ -87,8 +90,11 @@ def main():
               os.path.join(server, "user", "mods_storage")):
         os.makedirs(d)
     app = AutoApp()
+    # 真实后端：NanaZip 优先，回退 WinRAR
+    nanazip = find_nanazip()
+    winrar = find_winrar()
     app.cfg = {"client_root": client, "server_root": server,
-               "winrar_path": r"C:\Program Files\WinRAR\WinRAR.exe"}
+               "winrar_path": winrar or "", "nanazip_path": nanazip or ""}
 
     # 场景A：zip 客户端插件（1:1 直解）
     z_a = os.path.join(SANDBOX, "A.zip")
@@ -97,7 +103,7 @@ def main():
     check("A zip 客户端插件已安装",
           os.path.isfile(os.path.join(client, "BepInEx", "plugins", "PluginA", "PluginA.dll")))
 
-    # 场景B：7z 服务端 mod（暂存流程）
+    # 场景B：7z 服务端 mod（NanaZip 后端直接预览；WinRAR 后端走暂存）
     import py7zr
     src = os.path.join(SANDBOX, "src", "ModB")
     os.makedirs(src)

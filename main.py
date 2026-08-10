@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -17,14 +18,13 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import mod_detector as md
 import moddb
-from winrar import (find_winrar, list_archive, extract_to, looks_like_archive)
+from winrar import find_winrar, list_archive, extract_to
+from nanazip import find_nanazip
+from archive_backend import looks_like_archive, no_window as _no_window
 
 APP_TITLE = "塔科夫离线版mod解压"
 
 
-def _no_window():
-    """隐藏子进程控制台窗口（黑框）。"""
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 KINDS_TO_REJECT = {md.KIND_TRAVERSAL, md.KIND_EMPTY, md.KIND_NOT_ARCHIVE, md.KIND_UNKNOWN}
 
 
@@ -39,7 +39,7 @@ CONFIG_PATH = os.path.join(app_dir(), "config.json")
 
 def default_config():
     return {"client_root": "", "server_root": "", "winrar_path": "",
-            "mod_manager_enabled": True, "backup_dir": ""}
+            "nanazip_path": "", "mod_manager_enabled": True, "backup_dir": ""}
 
 
 def load_config():
@@ -146,7 +146,7 @@ class App:
         self.queue = queue.Queue()
         self.worker_active = False
         self.scan_busy = False
-        self.op_busy = False
+        self._backend_cache = None  # (backend, path) 缓存，避免每个包都重新探测
 
         root.title(APP_TITLE)
         root.geometry("920x640")
@@ -328,7 +328,10 @@ class App:
         row(0, "客户端根目录（BepInEx 所在）：", "client_root")
         row(1, "服务端根目录（user/mods 所在）：", "server_root")
         row(2, "WinRAR 程序路径：", "winrar_path")
-        row(3, "Mod 备份文件夹：", "backup_dir")
+        row(3, "NanaZip 程序路径（可选，优先使用）：", "nanazip_path")
+        row(4, "Mod 备份文件夹：", "backup_dir")
+        ttk.Label(grid, text="留空 NanaZip 时回退 WinRAR；填了 NanaZip 则全格式优先用 NanaZip。",
+                  foreground="#777").grid(row=5, column=0, columnspan=3, sticky="w", padx=4)
 
         mgr = ttk.Frame(f)
         mgr.pack(fill="x", padx=16)
@@ -378,6 +381,7 @@ class App:
                     cfg["client_root"] = path
                     cfg["server_root"] = detect_server_root(path) or path
                     cfg["winrar_path"] = cfg["winrar_path"] or find_winrar() or ""
+                    cfg["nanazip_path"] = cfg.get("nanazip_path") or find_nanazip() or ""
                     if not cfg.get("backup_dir"):
                         cfg["backup_dir"] = os.path.join(path, "ModBackup")
                     save_config(cfg)
@@ -386,8 +390,10 @@ class App:
                     self.log("已配置：客户端根=%s" % path)
                     if cfg["server_root"] and cfg["server_root"] != path:
                         self.log("自动检测服务端根=%s" % cfg["server_root"])
-                elif not os.path.isdir(cfg.get("winrar_path", "")) and not find_winrar():
-                    messagebox.showwarning(APP_TITLE, "未找到 WinRAR，请在设置中手动指定路径。")
+                elif (not os.path.isdir(cfg.get("winrar_path", "")) and not find_winrar()
+                      and not find_nanazip()):
+                    messagebox.showwarning(
+                        APP_TITLE, "未找到 NanaZip 或 WinRAR，请在设置中手动指定路径。")
             self._ui_call(ask)
 
     # ------------------------------------------------------- 通用工具
@@ -403,6 +409,10 @@ class App:
         if not getattr(sys, "frozen", False):
             print("[%s] %s" % (ts, msg))
 
+    def _set_status(self, text):
+        """更新状态栏标签（线程安全，交由 UI 线程执行）。"""
+        self._ui_call(lambda: self.lbl_status.configure(text=text))
+
     def _ui_call(self, fn):
         self.ui_jobs.put(fn)
 
@@ -415,7 +425,6 @@ class App:
             try:
                 fn()
             except Exception:
-                import traceback
                 traceback.print_exc()
         self.root.after(100, self.poll_ui)
 
@@ -426,9 +435,11 @@ class App:
         def show():
             ref["dlg"] = ChoiceDialog(title, msg, buttons, ev)
         self._ui_call(show)
-        while "dlg" not in ref and not self.root.winfo_exists():
+        # 等待对话框创建（窗口仍在时轮询），创建后等用户应答（最多 60s）。
+        deadline = time.time() + 60
+        while "dlg" not in ref and self.root.winfo_exists() and time.time() < deadline:
             ev.wait(0.05)
-        ev.wait(60)
+        ev.wait(max(0, deadline - time.time()))
         return ref["dlg"].result if "dlg" in ref else None
 
     def ask_name(self, title, msg, buttons, initial=""):
@@ -438,8 +449,12 @@ class App:
         def show():
             ref["dlg"] = NameDialog(title, msg, buttons, ev, initial)
         self._ui_call(show)
-        ev.wait(60)
+        deadline = time.time() + 60
+        while "dlg" not in ref and self.root.winfo_exists() and time.time() < deadline:
+            ev.wait(0.05)
+        ev.wait(max(0, deadline - time.time()))
         return ref["dlg"].result if "dlg" in ref else None
+
 
     # ------------------------------------------------------- 拖拽/选择
     def _on_drop(self, event):
@@ -470,160 +485,171 @@ class App:
             try:
                 self._process_one(path)
             except Exception:
-                import traceback
                 err = traceback.format_exc()
                 self.log("处理出错：\n%s" % err)
         self.worker_active = False
 
-    def _set_status(self, text):
-        self._ui_call(lambda: self.lbl_status.configure(text=text))
+    def _resolve_backend(self):
+        """解析解压后端，缓存结果。NanaZip 全格式优先，回退 WinRAR。
+        返回 (backend, path) 或 None（找不到）。设置变更后通过 _clear_backend_cache 失效。"""
+        if self._backend_cache is not None:
+            backend, path = self._backend_cache
+            if os.path.isfile(path):
+                return backend, path
+        cfg = self.cfg
+        nanazip = cfg.get("nanazip_path") or find_nanazip()
+        if nanazip and os.path.isfile(nanazip):
+            backend, path = "nanazip", nanazip
+        else:
+            winrar = cfg.get("winrar_path") or find_winrar()
+            if not winrar or not os.path.isfile(winrar):
+                return None
+            backend, path = "winrar", winrar
+        self._backend_cache = (backend, path)
+        # 探测到的路径回写 cfg 并持久化，避免下次重复探测
+        if backend == "nanazip" and not cfg.get("nanazip_path"):
+            cfg["nanazip_path"] = path
+            save_config(cfg)
+        elif backend == "winrar" and not cfg.get("winrar_path"):
+            cfg["winrar_path"] = path
+            save_config(cfg)
+        return backend, path
 
-    # ------------------------------------------------------- 核心流程
+    def _clear_backend_cache(self):
+        self._backend_cache = None
+
     def _process_one(self, archive):
         cfg = self.cfg
         self.log("=" * 50)
         self.log("处理：%s" % os.path.basename(archive))
         self._set_status("分析中…")
 
-        winrar = cfg.get("winrar_path") or find_winrar()
-        if not winrar or not os.path.isfile(winrar):
-            self._show_error("未找到 WinRAR\n请在「设置」页配置 WinRAR 程序路径。")
+        resolved = self._resolve_backend()
+        if not resolved:
+            self._show_error("未找到 NanaZip 或 WinRAR\n请在「设置」页配置解压程序路径。")
             return
-
+        backend, backend_path = resolved
+        nanazip = backend_path if backend == "nanazip" else None
         if not looks_like_archive(archive):
             self._show_error("「%s」不是受支持的压缩包（仅支持 zip / rar / 7z）。" % os.path.basename(archive))
             return
 
         try:
-            a = md.analyze_archive(winrar, archive)
+            a = md.analyze_archive(backend_path, archive,
+                                   nanazip_path=(nanazip if backend == "nanazip" else None))
         except RuntimeError as exc:
             self._show_error("分析失败：%s" % exc)
             return
         except Exception:
-            import traceback
             self._show_error("分析出错：\n%s" % traceback.format_exc())
             return
 
         staging = None
-        if a.kind == md.KIND_NEEDS_STAGING:
-            self.log("无法直接预览内容，先解压到临时目录检查…")
-            self._set_status("临时解压检查中…")
-            staging = tempfile.mkdtemp(prefix="mod_extract_")
-            ok = self._run_extract(winrar, archive, staging)
-            if not ok:
-                shutil.rmtree(staging, ignore_errors=True)
+        try:
+            if a.kind == md.KIND_NEEDS_STAGING:
+                self.log("无法直接预览内容，先解压到临时目录检查…")
+                self._set_status("临时解压检查中…")
+                staging = tempfile.mkdtemp(prefix="mod_extract_")
+                try:
+                    ok = self._run_extract(backend, backend_path, archive, staging)
+                    if not ok:
+                        return
+                    entries = md.walk_dir_entries(staging)
+                    a = md.analyze_entries(md.Analysis(archive=archive), entries)
+                    a.direct_extract = False
+                    a.issue = (a.issue + "；" if a.issue else "") + "内容来自临时解压检查"
+                    if not entries:
+                        self._show_error("压缩包解压后没有找到任何文件，已中止。")
+                        return
+                except Exception:
+                    self._show_error("临时解压检查出错：\n%s" % traceback.format_exc())
+                    return
+
+            self._show_analysis(a)
+
+            if a.kind in KINDS_TO_REJECT:
+                self._show_error("已中止：%s\n\n压缩包内容将不会被解压到任何位置。" %
+                                 md.KIND_NAMES.get(a.kind, a.kind))
                 return
-            entries = md.walk_dir_entries(staging)
-            a = md.analyze_entries(md.Analysis(archive=archive), entries)
-            a.direct_extract = False
-            a.issue = (a.issue + "；" if a.issue else "") + "内容来自临时解压检查"
-            if not entries:
-                shutil.rmtree(staging, ignore_errors=True)
-                self._show_error("压缩包解压后没有找到任何文件，已中止。")
+            if a.kind == md.KIND_MIXED:
+                self._show_error("已中止：压缩包结构无法自动判断，为避免解压到错误位置，请手动解压后确认。")
                 return
 
-        self._show_analysis(a)
-
-        if a.kind in KINDS_TO_REJECT:
-            if staging:
-                shutil.rmtree(staging, ignore_errors=True)
-            self._show_error("已中止：%s\n\n压缩包内容将不会被解压到任何位置。" %
-                             md.KIND_NAMES.get(a.kind, a.kind))
-            return
-
-        md.resolve_targets(cfg, a)
-
-        if a.kind == md.KIND_COMBO:
-            missing = [r for r in ("client_root", "server_root") if not os.path.isdir(cfg.get(r, ""))]
-            if missing:
-                if staging:
-                    shutil.rmtree(staging, ignore_errors=True)
+            if a.kind == md.KIND_COMBO:
+                missing = [r for r in ("client_root", "server_root") if not os.path.isdir(cfg.get(r, ""))]
+                if missing:
+                    self._show_error("游戏目录不存在：%s\n请在「设置」页重新配置。" %
+                                     " / ".join(cfg.get(r, "") for r in missing))
+                    return
+            elif not a.target_root or not os.path.isdir(cfg.get(a.target_root + "_root", "")):
                 self._show_error("游戏目录不存在：%s\n请在「设置」页重新配置。" %
-                                 " / ".join(cfg.get(r, "") for r in missing))
+                                 cfg.get(a.target_root + "_root", ""))
                 return
-        elif not a.target_root or not os.path.isdir(cfg.get(a.target_root + "_root", "")):
+            if a.needs_confirm and a.confirm_choices:
+                choice = self.ask_choice("确认安装方式", self._confirm_msg(a), a.confirm_choices)
+                if choice is None or choice == "取消" or choice.startswith("取消"):
+                    self._notice("已取消。")
+                    return
+                self._apply_choice(a, choice)
+
+            md.resolve_targets(cfg, a)
+            self.log("目标目录：%s" % a.target_dir)
+            self._set_status("检查目标…")
+
+            keep_links = False
+            target = a.target_dir
+            links = []
+            if a.internal_root and os.path.lexists(target):
+                if md.is_link(target):
+                    links = [target]
+                else:
+                    links = md.find_links_under(target)
+            if links:
+                self.log("发现软链接 %d 处：%s" % (len(links), links[0]))
+                choice = self.ask_choice(
+                    "软链接",
+                    "「%s」是软链接 → %s\n\n转为常规 mod？"
+                    % (os.path.basename(target), md.link_target(links[0])),
+                    ["转常规 mod", "保留链接", "取消"])
+                if choice is None or choice == "取消":
+                    self._notice("已取消。")
+                    return
+                if choice == "转常规 mod":
+                    for l in links:
+                        md.remove_link(l)
+                        self.log("已删除软链接：%s" % l)
+                else:
+                    keep_links = True
+                    self.log("保留软链接，解压内容将写入其指向的目录。")
+
+            # target 是共享 mod 容器目录（BepInEx/plugins）而非单个 mod 私有目录时，
+            # 绝不能整体删除——里面装着其他 mod。直接按文件合并解压覆盖同名文件即可。
+            _ir = os.path.normpath(a.internal_root).lower() if a.internal_root else ""
+            shared_container = _ir == os.path.normpath(os.path.join("bepinex", "plugins")).lower()
+            exists = a.internal_root and (os.path.exists(target) or md.is_link(target)) \
+                and not keep_links and not shared_container
+            if exists:
+                choice = self.ask_choice("覆盖", "目标已存在：\n%s\n\n删除后重新安装？" % target,
+                                         ["覆盖", "取消"])
+                if choice is None or choice != "覆盖":
+                    self._notice("已取消，未做任何修改。")
+                    return
+                self._delete_target(target)
+            elif shared_container and a.internal_root and os.path.lexists(target):
+                self.log("目标为共享插件目录，按文件覆盖（不删除其他插件）：%s" % target)
+
+            self._set_status("解压中…")
+            ok = self._extract(a, archive, backend, backend_path, keep_links, staging)
+            if ok:
+                self._set_status("完成")
+                self.log("✓ 完成：%s → %s" % (os.path.basename(archive), a.target_dir))
+                self._cleanup_storage(a)
+                self._record_install(a, archive)
+            else:
+                self._set_status("失败")
+        finally:
             if staging:
                 shutil.rmtree(staging, ignore_errors=True)
-            self._show_error("游戏目录不存在：%s\n请在「设置」页重新配置。" %
-                             cfg.get(a.target_root + "_root", ""))
-            return
-
-        if a.encrypted:
-            choice = self.ask_choice("提示", "压缩包可能加密，解压时 WinRAR 会弹窗要密码。\n继续？",
-                                     ["继续", "取消"])
-            if choice != "继续":
-                self._notice("已取消。")
-                return
-
-        if a.kind == md.KIND_MIXED:
-            if staging:
-                shutil.rmtree(staging, ignore_errors=True)
-            self._show_error("已中止：压缩包结构无法自动判断，为避免解压到错误位置，请手动解压后确认。")
-            return
-
-        if a.needs_confirm and a.confirm_choices:
-            choice = self.ask_choice("确认安装方式", self._confirm_msg(a), a.confirm_choices)
-            if choice is None or choice == "取消" or choice.startswith("取消"):
-                self._notice("已取消。")
-                if staging:
-                    shutil.rmtree(staging, ignore_errors=True)
-                return
-            self._apply_choice(a, choice)
-
-        md.resolve_targets(cfg, a)
-        self.log("目标目录：%s" % a.target_dir)
-        self._set_status("检查目标…")
-
-        keep_links = False
-        target = a.target_dir
-        links = []
-        if a.internal_root and os.path.lexists(target):
-            if md.is_link(target):
-                links = [target]
-            else:
-                links = md.find_links_under(target)
-        if links:
-            self.log("发现软链接 %d 处：%s" % (len(links), links[0]))
-            choice = self.ask_choice(
-                "软链接",
-                "「%s」是软链接 → %s\n\n转为常规 mod？"
-                % (os.path.basename(target), md.link_target(links[0])),
-                ["转常规 mod", "保留链接", "取消"])
-            if choice is None or choice == "取消":
-                self._notice("已取消。")
-                if staging:
-                    shutil.rmtree(staging, ignore_errors=True)
-                return
-            if choice == "转常规 mod":
-                for l in links:
-                    md.remove_link(l)
-                    self.log("已删除软链接：%s" % l)
-            else:
-                keep_links = True
-                self.log("保留软链接，解压内容将写入其指向的目录。")
-
-        exists = a.internal_root and (os.path.exists(target) or md.is_link(target)) and not keep_links
-        if exists:
-            choice = self.ask_choice("覆盖", "目标已存在：\n%s\n\n删除后重新安装？" % target,
-                                     ["覆盖", "取消"])
-            if choice is None or choice != "覆盖":
-                self._notice("已取消，未做任何修改。")
-                if staging:
-                    shutil.rmtree(staging, ignore_errors=True)
-                return
-            self._delete_target(target)
-
-        self._set_status("解压中…")
-        ok = self._extract(a, archive, winrar, keep_links, staging)
-        if ok:
-            self._set_status("完成")
-            self.log("✓ 完成：%s → %s" % (os.path.basename(archive), a.target_dir))
-            self._cleanup_storage(a)
-            self._record_install(a, archive)
-        else:
-            self._set_status("失败")
-        if staging:
-            shutil.rmtree(staging, ignore_errors=True)
 
     def _installed_side_names(self, a):
         """返回本次安装涉及的 (端, mod名) 列表，用于清理 storage。"""
@@ -635,6 +661,8 @@ class App:
                 if l.startswith("user/mods/") and len(p) >= 3:
                     pairs.append(("server", p[2]))
                 elif l.startswith("spt/user/mods/") and len(p) >= 4:
+                    pairs.append(("server", p[3]))
+                elif l.startswith("spt_runtime/user/mods/") and len(p) >= 4:
                     pairs.append(("server", p[3]))
         if a.kind in (md.KIND_CLIENT, md.KIND_COMBO):
             for e, l in zip(a.entries, lc):
@@ -725,6 +753,8 @@ class App:
                     if version:
                         break
         self.moddb.upsert(name, paths, self.cfg, version=version, source="install")
+        if self.moddb.last_error:
+            self.log("⚠ 记录已更新但写入数据库失败：%s" % self.moddb.last_error)
         self._ui_call(self._refresh_overview)
         self.log("已记录到 mod 列表：%s（%s）" % (name, self.moddb.get(name)["category"]))
 
@@ -735,13 +765,13 @@ class App:
         if a.issue:
             lines.append("注意：%s" % a.issue)
         if a.encrypted:
-            lines.append("注意：可能已加密（解压时 WinRAR 会弹窗要密码）")
+            lines.append("注意：可能已加密（解压时会要求输入密码）")
         lines += md.structure_brief(a.entries, a.kind, a.mod_name)
         self._show_info(lines)
 
     def _confirm_msg(self, a):
         if a.kind == md.KIND_COMBO:
-            return "客户端 → BepInEx\n服务端 → user\\mods（去 SPT/ 前缀）\n\n安装？"
+            return "客户端 → BepInEx\n服务端 → user\\mods（去 SPT/ 或 SPT_Runtime/ 前缀）\n\n安装？"
         if a.kind == md.KIND_CLIENT_FOLDER:
             return "「%s」装到哪里？" % a.mod_name
         if a.kind == md.KIND_SERVER_LOOSE:
@@ -773,25 +803,29 @@ class App:
         except OSError as exc:
             self.log("删除旧内容失败：%s" % exc)
 
-    def _extract(self, a, archive, winrar, keep_links, staging=None):
+    def _extract(self, a, archive, backend, backend_path, keep_links, staging=None):
         root = self.cfg.get(a.target_root + "_root", "")
         if a.direct_extract:
-            return self._run_extract(winrar, archive, root)
+            return self._run_extract(backend, backend_path, archive, root)
         own = staging is None
         if own:
             staging = tempfile.mkdtemp(prefix="mod_extract_")
         try:
-            ok = self._run_extract(winrar, archive, staging)
+            ok = self._run_extract(backend, backend_path, archive, staging)
             if not ok:
                 return False
             self._merge_staged(staging, a)
             return True
         finally:
-            if own:
-                shutil.rmtree(staging, ignore_errors=True)
+            # 无论自建还是外部传入，异常/成功都清理 staging（幂等）。
+            shutil.rmtree(staging, ignore_errors=True)
 
-    def _run_extract(self, winrar, archive, dest_root):
-        ok, msg = extract_to(winrar, archive, dest_root)
+    def _run_extract(self, backend, backend_path, archive, dest_root):
+        if backend == "nanazip":
+            from nanazip import extract_to as nz_extract
+            ok, msg = nz_extract(backend_path, archive, dest_root)
+        else:
+            ok, msg = extract_to(backend_path, archive, dest_root)
         if not ok:
             self._show_error("解压失败：%s" % msg)
             self.log("解压失败：%s" % msg)
@@ -806,17 +840,21 @@ class App:
                 low = top.lower()
                 if low == "bepinex":
                     self._merge_tree(src, os.path.join(self.cfg["client_root"], top))
-                elif low == "spt":
+                elif low in md.SERVER_ROOT_PROXIES:
+                    # SPT/ 或 SPT_Runtime/：内容整体并入服务端根（剥离该前缀）
                     self._merge_tree(src, self.cfg["server_root"])
                 elif low in ("user", "mods"):
                     self._merge_tree(src, os.path.join(self.cfg["server_root"], top))
+                elif low in md.CLIENT_ROOT_SIBLINGS:
+                    # EscapeFromTarkov_Data 等：作为客户端根同级目录原样并入
+                    self._merge_tree(src, os.path.join(self.cfg["client_root"], top))
                 else:
                     self.log("忽略顶层非游戏文件：%s" % top)
             self.log("已移动 → 客户端根 + 服务端根")
             return
         if a.kind == md.KIND_SERVER_ROOT:
             for top in os.listdir(staging):
-                if top.lower() == "spt":
+                if top.lower() in md.SERVER_ROOT_PROXIES:
                     self._merge_tree(os.path.join(staging, top), self.cfg["server_root"])
             self.log("已移动 → %s" % self.cfg["server_root"])
             return
@@ -873,17 +911,23 @@ class App:
                             "source": "scan",
                             "paths": sorted(set(paths)),
                         }
+                # 仅当游戏根目录实际可达时才按"路径不存在"清理记录；
+                # 根目录不可达（断网盘/未挂载）时保留记录，避免误删全部数据。
+                roots_reachable = all(os.path.isdir(self.cfg.get(r, ""))
+                                      for r in ("client_root", "server_root")
+                                      if self.cfg.get(r))
                 for name, rec in list(self.moddb.mods.items()):
                     if rec.get("state") != "backed_up":
                         kept = sorted(set(p for p in rec.get("paths", [])
                                           if os.path.exists(p)))
                         rec["paths"] = kept
-                        if not kept and not rec.get("backup_paths"):
+                        if not kept and not rec.get("backup_paths") and roots_reachable:
                             del self.moddb.mods[name]
                 self.moddb.save()
+                if self.moddb.last_error:
+                    self.log("⚠ 扫描结果已更新但写入数据库失败：%s" % self.moddb.last_error)
                 self._ui_call(self._refresh_overview)
             except Exception:
-                import traceback
                 self.log("扫描出错：\n%s" % traceback.format_exc())
                 if hasattr(self, "lbl_summary"):
                     self._ui_call(lambda: self.lbl_summary.configure(text="扫描出错"))
@@ -1077,8 +1121,12 @@ class App:
         if not names:
             return
         all_fav = all((self.moddb.get(n) or {}).get("favorite") for n in names)
-        for n in names:
-            self.moddb.set_favorite(n, not all_fav)
+        self.moddb.begin_batch()
+        try:
+            for n in names:
+                self.moddb.set_favorite(n, not all_fav)
+        finally:
+            self.moddb.flush()
         self._refresh_overview()
 
     def _toggle_save(self, names=None):
@@ -1110,8 +1158,12 @@ class App:
                                          % len(names), ["整组标记", "取消"])
                 if choice != "整组标记":
                     return
-            for n in names:
-                self.moddb.set_save_critical(n, not all_crit)
+            self.moddb.begin_batch()
+            try:
+                for n in names:
+                    self.moddb.set_save_critical(n, not all_crit)
+            finally:
+                self.moddb.flush()
         self._ui_call(self._refresh_overview)
 
     def _loc_label(self, path):
@@ -1162,7 +1214,6 @@ class App:
             try:
                 fn()
             except Exception:
-                import traceback
                 self.log("操作出错：\n%s" % traceback.format_exc())
                 self._show_error("操作出错，请查看日志。")
             finally:
@@ -1275,9 +1326,13 @@ class App:
             return
         self._set_status("移入备份…")
         failed = []
-        for name in todo:
-            if not self._backup_one(name):
-                failed.append(name)
+        self.moddb.begin_batch()
+        try:
+            for name in todo:
+                if not self._backup_one(name):
+                    failed.append(name)
+        finally:
+            self.moddb.flush()
         self._set_status("完成" if not failed else "部分失败")
         if failed:
             self._show_error("部分 Mod 备份失败（已各自回滚）：%s" % "、".join(failed))
@@ -1322,6 +1377,8 @@ class App:
             self.log("备份失败（已回滚）：%s：%s" % (name, exc))
             return False
         self.moddb.set_backed_up(name, True, records)
+        if self.moddb.last_error:
+            self.log("⚠ 备份已完成但写入数据库失败：%s" % self.moddb.last_error)
         return True
 
     def _restore_mod(self, names=None):
@@ -1345,9 +1402,13 @@ class App:
             return
         self._set_status("还原中…")
         failed = []
-        for name in todo:
-            if not self._restore_one(name):
-                failed.append(name)
+        self.moddb.begin_batch()
+        try:
+            for name in todo:
+                if not self._restore_one(name):
+                    failed.append(name)
+        finally:
+            self.moddb.flush()
         self._set_status("完成" if not failed else "部分失败")
         if failed:
             self._show_error("部分 Mod 还原失败（已各自回滚）：%s" % "、".join(failed))
@@ -1381,9 +1442,9 @@ class App:
                         os.rename(src, bak)
                 except OSError:
                     pass
-            self.log("还原失败（已回滚）：%s：%s" % (name, exc))
-            return False
         self.moddb.set_backed_up(name, False)
+        if self.moddb.last_error:
+            self.log("⚠ 还原已完成但写入数据库失败：%s" % self.moddb.last_error)
         return True
 
     def _root_of(self, path):
@@ -1407,8 +1468,12 @@ class App:
                                initial=default)
         if not result or result[0] != "确定" or not result[1]:
             return
-        for name in names:
-            self.moddb.set_group(name, result[1])
+        self.moddb.begin_batch()
+        try:
+            for name in names:
+                self.moddb.set_group(name, result[1])
+        finally:
+            self.moddb.flush()
         self.log("✓ 已合并为一组：%s（%d 个 Mod）" % (result[1], len(names)))
         self._ui_call(self._refresh_overview)
 
@@ -1430,12 +1495,15 @@ class App:
         self.log("✓ 已移出组：%s" % names[0])
         self._ui_call(self._refresh_overview)
 
-    # ------------------------------------------------------- 设置页
     def _browse(self, key):
         var = self.cfg_vars[key]
         if key == "winrar_path":
             path = filedialog.askopenfilename(
                 title="选择 WinRAR.exe", filetypes=[("WinRAR", "WinRAR.exe"), ("exe", "*.exe")])
+        elif key == "nanazip_path":
+            path = filedialog.askopenfilename(
+                title="选择 NanaZip/7z 可执行文件",
+                filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
         else:
             path = filedialog.askdirectory(title="选择目录")
         if path:
@@ -1443,6 +1511,7 @@ class App:
 
     def _auto_detect_all(self):
         self.cfg_vars["winrar_path"].set(find_winrar() or "")
+        self.cfg_vars["nanazip_path"].set(find_nanazip() or "")
         self._ui_call(self._auto_detect_parts)
 
     def _auto_detect_parts(self):
@@ -1470,6 +1539,7 @@ class App:
             messagebox.showwarning(APP_TITLE, "客户端根目录不存在，请重新选择。")
             return
         save_config(self.cfg)
+        self._clear_backend_cache()
         self._apply_manager_visibility()
         self.log("设置已保存 → %s" % CONFIG_PATH)
 
@@ -1509,6 +1579,14 @@ def run_selftest():
     report.write("selftest start\n")
     winrar = find_winrar()
     report.write("winrar=%s\n" % winrar)
+    nanazip = find_nanazip()
+    report.write("nanazip=%s\n" % nanazip)
+    if nanazip:
+        report.write("backend=nanazip\n")
+    elif winrar:
+        report.write("backend=winrar\n")
+    else:
+        report.write("backend=NONE\n")
     cfg = load_config()
     client_root = cfg.get("client_root", "")
     if os.path.isdir(client_root):

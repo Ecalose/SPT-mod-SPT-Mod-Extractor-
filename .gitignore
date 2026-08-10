@@ -13,3 +13,6 @@ dist/
 
 # 自检输出
 selftest_result.txt
+
+# 调试残留
+_nz_dbg/

@@ -74,6 +74,8 @@ class ModDB:
     def __init__(self, path):
         self.path = path
         self.mods = {}
+        self.last_error = ""
+        self._batch = False  # 批量模式：抑制每次 setter 的全量写盘，由 flush() 统一提交
         self._load()
 
     def _load(self):
@@ -85,11 +87,29 @@ class ModDB:
             self.mods = {}
 
     def save(self):
+        """全量写盘。批量模式下（_batch=True）为空操作，改由 flush() 统一提交。"""
+        if self._batch:
+            return True
+        return self.flush()
+
+    def begin_batch(self):
+        """进入批量模式：之后的 setter 不立即写盘，直到 flush()。"""
+        self._batch = True
+
+    def flush(self):
+        """提交积攒的变更并退出批量模式。返回是否写盘成功。"""
+        self._batch = False
         try:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump({"mods": self.mods}, f, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
+            self.last_error = ""
+            return True
+        except OSError as exc:
+            # 写入失败不抛异常（避免拖垮整个操作），但记录错误供上层提示。
+            self.last_error = str(exc)
+            import sys
+            print("ModDB 保存失败：%s" % exc, file=sys.stderr)
+            return False
 
     def upsert(self, name, paths, cfg, version="", source="install"):
         if not name:
